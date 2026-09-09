@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Build TRAINS_Phase1_Stage10_ATTEMPT18.mcaddon
+=============================================
+Fix-forward on the byte-verified Stage10 ATTEMPT15 package (byte-verified
+Stage9 ATTEMPT5 c8cb356b + one additive traffic hunk). Addresses the second
+independent audit rejection (two blockers); no Stage7/8/9 rebuild, no
+TrafficManager rewrite.
+
+Edits (each asserted to match exactly once in the ATTEMPT15 source):
+  E1   ReservationManager: read-only getOwner(sectionId)                         (identical to ATTEMPT16/17)
+  E8   ReservationManager: read-only getOwnershipState(sectionId, world) - NEW ATTEMPT18
+       Tri-state OWNED{owner} / FREE / UNKNOWN. Resolves ONLY the exact deterministic
+       reservation shard (double-hash primary_sub; in-memory hit, else direct persisted
+       tryLoad of that one shard). Never scans shard Maps, never creates shards, never
+       mutates reservation state. A null/absent owner is NEVER "FREE".
+  E2'' OccupancyManager: _resolveOccupancyRecord / getOccupancyState / getOccupant
+       ZERO shard iteration: resolves ONLY via SectionLocationIndex.getLocation
+       (location/rootPos) -> exact rootPos-derived occupancy shard key -> one Map.get.
+       sectionManager.shards fallback REMOVED; unresolvable => null (safe-fail).
+  E3'  NavigationManager.canEnterRouteSection (unchanged from ATTEMPT17): occupancy read
+       via getOccupancyState; stale-held contract for self-held UNKNOWN/CONFLICT.
+  E4   Stage9 removeSections wrapper -> invalidateTrafficForSectionId              (identical)
+  E5   OccupancyManager.handleTrainDisappearance -> invalidateTrafficForTrainId    (identical)
+  E6   ATTEMPT18 traffic block: helper on getOwnershipState tri-state gate.
+  E7   Real worldLoaded handler calls loadTrafficOnWorldLoad(world19) at world load.
+Both pack manifests bumped 1.1.6 -> 1.1.9 (header + cross-dependency).
+
+Emits dev/patch_manifest_attempt18.json with the exact inserted line sets.
+"""
+import hashlib, json, os, sys, zipfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_MCADDON = os.path.join(
+    REPO, os.environ.get("ATTEMPTA_PKG", "TRAINS_Phase1_Stage10_ATTEMPT15.mcaddon"))
+OUT_MCADDON = os.path.join(
+    REPO, os.environ.get("ATTEMPT_OUT", "TRAINS_Phase1_Stage10_ATTEMPT18.mcaddon"))
+TRAFFIC_BLOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             os.environ.get("ATTEMPT_BLOCK", "traffic_block_attempt18.js"))
+MANIFEST_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patch_manifest_attempt18.json")
+BP_PREFIX = "TRAINS Urban Update Add-On/"
+RP_PREFIX = "TRAINS Urban Update Add-On by matiss/"
+MAIN_JS = BP_PREFIX + "scripts/main.js"
+OLD_VER = [1, 1, 6]
+NEW_VER = [1, 1, 9]
+
+def fail(msg):
+    print("BUILD FAILED: " + msg)
+    sys.exit(1)
+
+def replace_once(text, old, new, label):
+    n = text.count(old)
+    if n != 1:
+        fail(f"{label}: anchor found {n} times (expected 1)")
+    return text.replace(old, new, 1)
+
+# ---------------- exact inserted texts (shared with the test harness via JSON) ----------------
+E1_ADD = [
+    "  // ATTEMPT16: minimal read-only authoritative ownership lookup for traffic arbitration.",
+    "  // Reads the existing knownSectionToTrain state only - no duplicated state, no mutation.",
+    "  getOwner(sectionId) { if (!sectionId) return null; try { const o = this.knownSectionToTrain.get(sectionId); return o ? o : null; } catch(e) { return null; } }",
+]
+
+E8_ADD = [
+    "  // ATTEMPT18: read-only authoritative ownership tri-state for traffic release arbitration:",
+    "  //   OWNED{owner}  (a reservation record resolves for this section),",
+    "  //   FREE          (the exact deterministic reservation shard answered authoritatively with no record),",
+    "  //   UNKNOWN       (shard unloaded / unresolvable / probe failure - includes never-persisted).",
+    "  // Resolves ONLY the single deterministic reservation shard (fnv1a/djb2 double-hash primary_sub):",
+    "  // in-memory map hit, else direct persisted tryLoad of that one shard. NEVER scans shard Maps,",
+    "  // never creates shards, never writes/caches, never mutates reservation state. A null/absent owner",
+    "  // from the in-memory map alone is NEVER interpreted as FREE (that is the ATTEMPT17 audit blocker).",
+    "  getOwnershipState(sectionId, world) { if (!sectionId) return { state: 'UNKNOWN', owner: null }; try { try { const o = this.knownSectionToTrain.get(sectionId); if (o) return { state: 'OWNED', owner: o }; } catch (e0) { return { state: 'UNKNOWN', owner: null }; } let ix = null; try { ix = this.getShardIndicesForSectionId(sectionId); } catch (e1) { ix = null; } if (!ix) return { state: 'UNKNOWN', owner: null }; let shard = null; try { shard = this.shards.get(this.getShardKey(ix.primary, ix.sub)) || null; } catch (e2) { shard = null; } if (!shard) { if (!world) return { state: 'UNKNOWN', owner: null }; try { shard = ReservationShard.tryLoad(world, ix.primary, ix.sub) || null; } catch (e3) { return { state: 'UNKNOWN', owner: null }; } if (!shard) return { state: 'UNKNOWN', owner: null }; } if (!shard.records) return { state: 'UNKNOWN', owner: null }; const rec = shard.records.get(sectionId); if (rec && rec.trainId) return { state: 'OWNED', owner: rec.trainId }; return { state: 'FREE', owner: null }; } catch (e) { return { state: 'UNKNOWN', owner: null }; } }",
+]
+
+E2_ADD = [
+    "  // ATTEMPT18: bounded deterministic occupancy lookup with ZERO shard iteration. Resolves ONLY through",
+    "  // the authoritative Stage8 SectionLocationIndex (section location/rootPos) -> exact occupancy shard key",
+    "  // (the same rootPos-derived getShardKey used by setOccupied/setEmpty/setUnknown) -> a single Map.get.",
+    "  // If the location cannot be resolved, returns null (safe-fail): absent is NEVER \"free\". NEVER iterates",
+    "  // section or occupancy shard Maps (the ATTEMPT17 sectionManager fallback loop was removed), never",
+    "  // mutates, never auto-creates/loads shards for reads.",
+    '  _resolveOccupancyRecord(sectionId, world) { if (!sectionId) return null; try { let dimId = null; let rootPos = null; try { if (typeof sectionLocationIndexManager !== "undefined" && sectionLocationIndexManager && sectionLocationIndexManager.getLocation) { const loc = sectionLocationIndexManager.getLocation(sectionId, world || null); if (loc) { if (loc.dimId) dimId = loc.dimId; if (loc.rootPos) rootPos = loc.rootPos; } } } catch (lerr) {} if (!dimId || !rootPos) return null; const shard = this.shards.get(this.getShardKey(dimId, rootPos)); if (!shard || !shard.records) return null; return shard.records.get(sectionId) || null; } catch (e) { return null; } }',
+    "  // ATTEMPT17/18 safety contract: authoritative occupancy state for a section, or null when it cannot",
+    "  // be established (unknown / unloaded / probe failed). Absent is NEVER free: only an authoritative",
+    "  // KNOWN_EMPTY record proves a section is not occupied. Returns { state, trainId, trainIds } when known.",
+    "  getOccupancyState(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (!rec || !rec.state) return null; return { state: rec.state, trainId: rec.trainId || null, trainIds: (rec.trainIds && rec.trainIds.slice) ? rec.trainIds.slice() : [] }; } catch (e) { return null; } }",
+    "  // ATTEMPT16: read-only occupant accessor (semantics unchanged). ATTEMPT18: index-only direct resolve.",
+    '  getOccupant(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (rec && rec.state === "KNOWN_OCCUPIED") { if (rec.trainId) return rec.trainId; if (rec.trainIds && rec.trainIds.length) return rec.trainIds[0]; } return null; } catch (e) { return null; } }',
+]
+
+# NavigationManager.canEnterRouteSection occupancy check, ATTEMPT17 form (E3'). Two physical lines.
+E3_NAV_HEAD = "      try { if (typeof occupancyManager !== \"undefined\" && occupancyManager.getOccupancyState) { const occInfo = occupancyManager.getOccupancyState(sectionId, world); if (occInfo && occInfo.state && (occInfo.state === 'UNKNOWN' || occInfo.state === 'CONFLICT')) { let __owner8 = null; try { if (typeof reservationManager !== \"undefined\" && reservationManager.getOwner) { __owner8 = reservationManager.getOwner(sectionId); } } catch(e9) {} if (__owner8 && __owner8 === trainId) { return {ok:true, canEnter:false, owner: trainId, state:'held', stale:true, releaseWhenPossible:true, reason:'stale_ahead_holding_pending_release'}; } return {ok:true, canEnter:false, state: occInfo.state, owner: (__owner8 || null), reason:'unknown_or_conflict_safely_blocked'}; } // ATTEMPT16 G-fix (ATTEMPT17 form): another train's KNOWN_OCCUPIED section blocks entry; own occupancy remains allowed. ATTEMPT17: direct shard resolution (no all-shard scan); self-held reservation + UNKNOWN/CONFLICT occupancy = authoritative stale-held contract (safe-fail, release-managed, never auto-synced)."
+E3_NAV_TAIL = "if (occInfo && occInfo.state === 'KNOWN_OCCUPIED') { const occIds = []; try { if (occInfo.trainId) occIds.push(occInfo.trainId); if (occInfo.trainIds && occInfo.trainIds.length) { for (const oid of occInfo.trainIds) { if (oid && occIds.indexOf(oid) === -1) occIds.push(oid); } } } catch(e2) {} let __sameTrain = false; for (let __i = 0; __i < occIds.length; __i++) { if (occIds[__i] === trainId) { __sameTrain = true; break; } } if (!__sameTrain && occIds.length > 0) { return {ok:true, canEnter:false, state:'OCCUPIED_BY_OTHER', owner: occIds[0], reason:'occupied_by_other_train'}; } } } } catch(e) {}"
+
+E4_ADD = "try{if(typeof invalidateTrafficForSectionId!==\"undefined\"&&invalidateTrafficForSectionId){invalidateTrafficForSectionId(id,world);}}catch(e){}"
+
+E5_ADD = [
+    "    // ATTEMPT16: notify traffic layer of disappearance (guarded hook; occupancy state untouched here).",
+    "    // Traffic safely releases tracked reservations and only drops its record when all releases are confirmed.",
+    "    try { if (typeof invalidateTrafficForTrainId !== 'undefined' && invalidateTrafficForTrainId) { invalidateTrafficForTrainId(trainId, world || null); } } catch(e) {}",
+]
+
+E7_ADD = [
+    "  // ATTEMPT17: traffic records load at world load (authoritative re-read after restart), not at script eval.",
+    "  try { if (typeof loadTrafficOnWorldLoad !== \"undefined\" && loadTrafficOnWorldLoad) { loadTrafficOnWorldLoad(world19); } } catch (e) {}",
+]
+
+def main():
+    with zipfile.ZipFile(SRC_MCADDON, "r") as z:
+        names = z.namelist()
+        data = {name: z.read(name) for name in names}
+    print(f"source ({os.path.basename(SRC_MCADDON)}) entries: {len(names)}")
+
+    main_js = data[MAIN_JS].decode("utf-8")
+    with open(TRAFFIC_BLOCK, "r", encoding="utf-8") as f:
+        traffic_block = f.read()
+    if "ATTEMPT18" not in traffic_block.split("\n", 1)[0]:
+        fail("traffic block is not the ATTEMPT18 block")
+
+    # ---------------- E1 + E8: ReservationManager getOwner + getOwnershipState ----------------
+    e1_anchor = "  getReservationsForTrain(trainId, world) { if (!trainId) return []; try { const set = this.knownTrainToSections.get(trainId); if (!set) return []; const out = []; for (const sid of set) { const shard = this.getOrCreateShard(sid, world); const rec = shard.records.get(sid); if (rec) out.push(rec); } return out; } catch(e) { return []; } }\n"
+    e1_insert = e1_anchor + "\n".join(E1_ADD) + "\n" + "\n".join(E8_ADD) + "\n"
+    main_js = replace_once(main_js, e1_anchor, e1_insert, "E1/E8 ownership APIs")
+
+    # ---------------- E2'': OccupancyManager index-only direct-resolve APIs ----------------
+    e2_anchor = "  findSectionsForRailPos(dimId, railPos, world) {\n    const sectionIds=[];"
+    e2_insert = "\n".join(E2_ADD) + "\n" + e2_anchor
+    main_js = replace_once(main_js, e2_anchor, e2_insert, "E2'' occupancy index-only APIs")
+
+    # ---------------- E3': canEnterRouteSection direct occupancy contract (unchanged) ----------------
+    e3_old = "      try { if (typeof occupancyManager !== 'undefined' && occupancyManager.shards) { for (const [k, shard] of occupancyManager.shards) { if (shard.records && shard.records.has(sectionId)) { const occ = shard.records.get(sectionId); if (occ) { if (occ.state === 'UNKNOWN' || occ.state === 'CONFLICT') { return {ok:true, canEnter:false, state: occ.state, reason:'unknown_or_conflict_safely_blocked'}; } } break; } } } } catch(e) {}"
+    e3_new = E3_NAV_HEAD + "\n" + E3_NAV_TAIL
+    main_js = replace_once(main_js, e3_old, e3_new, "E3' canEnter occupancy contract")
+
+    # ---------------- E4: removeSections wrapper -> traffic invalidation ----------------
+    e4_old = "drivingManager.invalidateForSectionId(id,world);\n}"
+    e4_new = ("drivingManager.invalidateForSectionId(id,world);\n" + E4_ADD + "\n}")
+    main_js = replace_once(main_js, e4_old, e4_new, "E4 wrapper traffic section invalidation")
+
+    # ---------------- E5: handleTrainDisappearance -> traffic invalidation ----------------
+    e5_old = "    this.lastTrainMembers.delete(trainId);\n    this.lastTrainPositions.delete(trainId);\n    return affected;"
+    e5_new = ("\n".join(E5_ADD) + "\n"
+              "    this.lastTrainMembers.delete(trainId);\n    this.lastTrainPositions.delete(trainId);\n    return affected;")
+    main_js = replace_once(main_js, e5_old, e5_new, "E5 disappearance traffic hook")
+
+    # ---------------- E6: replace ATTEMPT15 traffic block with ATTEMPT18 ----------------
+    start_marker = "// Stage10 ATTEMPT15 layered on REAL Stage9 ATTEMPT5 c8cb356b - traffic fixes"
+    end_marker = "// scripts/events/world.ts"
+    si = main_js.find(start_marker)
+    ei = main_js.find(end_marker)
+    if si == -1 or ei == -1 or ei <= si:
+        fail("E6: traffic block markers not found/inverted")
+    main_js = main_js[:si] + traffic_block + main_js[ei:]
+
+    # ---------------- E7: world-load traffic wiring (real worldLoaded handler) ----------------
+    e7_old = ("function worldLoaded(_e) {\n"
+              "  system26.runTimeout(() => {\n"
+              "    WorldLoaded = true;\n"
+              "  }, TicksPerSecond9 * 3);")
+    e7_new = e7_old + "\n" + "\n".join(E7_ADD)
+    main_js = replace_once(main_js, e7_old, e7_new, "E7 world-load traffic wiring")
+
+    # ---------------- post-edit sanity ----------------
+    for label, needle in (
+        ("getOwnershipState", "  getOwnershipState(sectionId, world) {"),
+        ("getOccupancyState", "  getOccupancyState(sectionId, world) {"),
+        ("_resolveOccupancyRecord", "  _resolveOccupancyRecord(sectionId, world) {"),
+        ("getOccupant", "  getOccupant(sectionId, world) {"),
+        ("getOwner", "  getOwner(sectionId) {"),
+        ("stale contract", "stale_ahead_holding_pending_release"),
+        ("E7 wiring", "loadTrafficOnWorldLoad(world19);"),
+        ("ATTEMPT18 block", "// Stage10 ATTEMPT18 layered on REAL Stage9 ATTEMPT5 c8cb356b - traffic fixes"),
+    ):
+        if main_js.count(needle) != 1:
+            fail(f"post-check {label}: found {main_js.count(needle)} occurrences, expected 1")
+    # blocker 1: resolver must contain zero shard-Map iteration and no sectionManager fallback
+    ri = main_js.index("  _resolveOccupancyRecord(sectionId, world) {")
+    rbody = main_js[ri:main_js.index("\n", ri)]
+    if "sectionManager" in rbody or "for (const" in rbody:
+        fail("post-check: occupancy resolver still references sectionManager or iterates")
+    # blocker 2: traffic helper must consult getOwnershipState, never getOwner
+    hi = main_js.index("function safelyReleaseTrafficReservation(")
+    he = main_js.index("\nclass TrafficManager{", hi)
+    hbody = main_js[hi:he]
+    if "getOwnershipState(secId" not in hbody or ".getOwner(" in hbody:
+        fail("post-check: traffic helper does not use the ownership tri-state gate")
+    if "reason:'unknown_or_conflict_safely_blocked'}; } break;" in main_js:
+        fail("post-check: old shard-scanning nav occupancy line still present")
+    if "// Stage10 ATTEMPT15 layered" in main_js:
+        fail("post-check: ATTEMPT15 traffic block still present")
+
+    data[MAIN_JS] = main_js.encode("utf-8")
+
+    # ---------------- manifest version bumps -> [1,1,9] ----------------
+    for prefix, other_uuid in ((BP_PREFIX, "56ca16b1-f4df-4512-b739-e72d8367d309"),
+                               (RP_PREFIX, "ab5cde80-a5b3-48b1-85db-3048b2dbc6ab")):
+        mname = prefix + "manifest.json"
+        man = json.loads(data[mname].decode("utf-8"))
+        assert man["header"]["version"] == OLD_VER, mname
+        man["header"]["version"] = NEW_VER
+        for dep in man.get("dependencies", []):
+            if dep.get("uuid") == other_uuid:
+                assert dep["version"] == OLD_VER, mname
+                dep["version"] = NEW_VER
+        data[mname] = json.dumps(man, separators=(",", ":")).encode("utf-8")
+
+    # ---------------- write package ----------------
+    if os.path.exists(OUT_MCADDON):
+        os.remove(OUT_MCADDON)
+    with zipfile.ZipFile(OUT_MCADDON, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in names:  # preserve original entry order
+            z.writestr(name, data[name])
+
+    # ---------------- emit patch manifest for the test harness ----------------
+    with open(MANIFEST_OUT, "w", encoding="utf-8") as f:
+        json.dump({
+            "attempt": "18",
+            "base": os.path.basename(SRC_MCADDON),
+            "out": os.path.basename(OUT_MCADDON),
+            "version": NEW_VER,
+            "e1Add": E1_ADD, "e8Add": E8_ADD, "e2Add": E2_ADD,
+            "e3NavHead": E3_NAV_HEAD, "e3NavTail": E3_NAV_TAIL,
+            "e3Old": e3_old,
+            "e4Add": E4_ADD, "e5Add": E5_ADD, "e7Add": E7_ADD,
+            "trafficStartMarker": "// Stage10 ATTEMPT18 layered on REAL Stage9 ATTEMPT5 c8cb356b - traffic fixes",
+        }, f, indent=1)
+
+    with open(OUT_MCADDON, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    size = os.path.getsize(OUT_MCADDON)
+    lines = main_js.count("\n") + 1
+    print(f"OK: wrote {OUT_MCADDON}")
+    print(f"  SHA256: {sha}")
+    print(f"  bytes:  {size}")
+    print(f"  entries: {len(names)}")
+    print(f"  main.js: {len(data[MAIN_JS])} bytes, {lines} lines")
+
+if __name__ == "__main__":
+    main()
