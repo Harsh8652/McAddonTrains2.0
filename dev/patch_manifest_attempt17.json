@@ -1,0 +1,42 @@
+{
+ "attempt": "17",
+ "base": "TRAINS_Phase1_Stage10_ATTEMPT15.mcaddon",
+ "out": "TRAINS_Phase1_Stage10_ATTEMPT17.mcaddon",
+ "version": [
+  1,
+  1,
+  8
+ ],
+ "e1Add": [
+  "  // ATTEMPT16: minimal read-only authoritative ownership lookup for traffic arbitration.",
+  "  // Reads the existing knownSectionToTrain state only - no duplicated state, no mutation.",
+  "  getOwner(sectionId) { if (!sectionId) return null; try { const o = this.knownSectionToTrain.get(sectionId); return o ? o : null; } catch(e) { return null; } }"
+ ],
+ "e2Add": [
+  "  // ATTEMPT17: bounded deterministic occupancy lookup. Resolves the section's authoritative occupancy",
+  "  // shard DIRECTLY via the Stage8 SectionLocationIndex.getLocation (or the Section's rootPos), keyed with",
+  "  // the same rootPos-derived getShardKey used by setOccupied/setEmpty/setUnknown. NEVER iterates loaded",
+  "  // occupancy shards, never mutates, never auto-creates/loads shards for reads.",
+  "  _resolveOccupancyRecord(sectionId, world) { if (!sectionId) return null; try { let dimId = null; let rootPos = null; try { if (typeof sectionLocationIndexManager !== \"undefined\" && sectionLocationIndexManager && sectionLocationIndexManager.getLocation) { const loc = sectionLocationIndexManager.getLocation(sectionId, world || null); if (loc) { if (loc.dimId) dimId = loc.dimId; if (loc.rootPos) rootPos = loc.rootPos; } } } catch (lerr) {} if ((!dimId || !rootPos) && typeof sectionManager !== \"undefined\" && sectionManager && sectionManager.shards) { for (const [sk, sShard] of sectionManager.shards) { if (sShard && sShard.sections && sShard.sections.has(sectionId)) { const sec = sShard.sections.get(sectionId); if (sec) { if (!dimId && sec.dimId) dimId = sec.dimId; if (!rootPos && sec.rootPos) rootPos = sec.rootPos; } break; } } } if (!dimId || !rootPos) return null; const shard = this.shards.get(this.getShardKey(dimId, rootPos)); if (!shard || !shard.records) return null; return shard.records.get(sectionId) || null; } catch (e) { return null; } }",
+  "  // ATTEMPT17 safety contract: authoritative occupancy state for a section, or null when it cannot be",
+  "  // established (unknown / unloaded / probe failed). Absent is NEVER free: only an authoritative",
+  "  // KNOWN_EMPTY record proves a section is not occupied. Returns { state, trainId, trainIds } when known.",
+  "  getOccupancyState(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (!rec || !rec.state) return null; return { state: rec.state, trainId: rec.trainId || null, trainIds: (rec.trainIds && rec.trainIds.slice) ? rec.trainIds.slice() : [] }; } catch (e) { return null; } }",
+  "  // ATTEMPT16: read-only occupant accessor (semantics unchanged). ATTEMPT17: direct shard resolve (no scan).",
+  "  getOccupant(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (rec && rec.state === \"KNOWN_OCCUPIED\") { if (rec.trainId) return rec.trainId; if (rec.trainIds && rec.trainIds.length) return rec.trainIds[0]; } return null; } catch (e) { return null; } }"
+ ],
+ "e3NavHead": "      try { if (typeof occupancyManager !== \"undefined\" && occupancyManager.getOccupancyState) { const occInfo = occupancyManager.getOccupancyState(sectionId, world); if (occInfo && occInfo.state && (occInfo.state === 'UNKNOWN' || occInfo.state === 'CONFLICT')) { let __owner8 = null; try { if (typeof reservationManager !== \"undefined\" && reservationManager.getOwner) { __owner8 = reservationManager.getOwner(sectionId); } } catch(e9) {} if (__owner8 && __owner8 === trainId) { return {ok:true, canEnter:false, owner: trainId, state:'held', stale:true, releaseWhenPossible:true, reason:'stale_ahead_holding_pending_release'}; } return {ok:true, canEnter:false, state: occInfo.state, owner: (__owner8 || null), reason:'unknown_or_conflict_safely_blocked'}; } // ATTEMPT16 G-fix (ATTEMPT17 form): another train's KNOWN_OCCUPIED section blocks entry; own occupancy remains allowed. ATTEMPT17: direct shard resolution (no all-shard scan); self-held reservation + UNKNOWN/CONFLICT occupancy = authoritative stale-held contract (safe-fail, release-managed, never auto-synced).",
+ "e3NavTail": "if (occInfo && occInfo.state === 'KNOWN_OCCUPIED') { const occIds = []; try { if (occInfo.trainId) occIds.push(occInfo.trainId); if (occInfo.trainIds && occInfo.trainIds.length) { for (const oid of occInfo.trainIds) { if (oid && occIds.indexOf(oid) === -1) occIds.push(oid); } } } catch(e2) {} let __sameTrain = false; for (let __i = 0; __i < occIds.length; __i++) { if (occIds[__i] === trainId) { __sameTrain = true; break; } } if (!__sameTrain && occIds.length > 0) { return {ok:true, canEnter:false, state:'OCCUPIED_BY_OTHER', owner: occIds[0], reason:'occupied_by_other_train'}; } } } } catch(e) {}",
+ "e3Old": "      try { if (typeof occupancyManager !== 'undefined' && occupancyManager.shards) { for (const [k, shard] of occupancyManager.shards) { if (shard.records && shard.records.has(sectionId)) { const occ = shard.records.get(sectionId); if (occ) { if (occ.state === 'UNKNOWN' || occ.state === 'CONFLICT') { return {ok:true, canEnter:false, state: occ.state, reason:'unknown_or_conflict_safely_blocked'}; } } break; } } } } catch(e) {}",
+ "e4Add": "try{if(typeof invalidateTrafficForSectionId!==\"undefined\"&&invalidateTrafficForSectionId){invalidateTrafficForSectionId(id,world);}}catch(e){}",
+ "e5Add": [
+  "    // ATTEMPT16: notify traffic layer of disappearance (guarded hook; occupancy state untouched here).",
+  "    // Traffic safely releases tracked reservations and only drops its record when all releases are confirmed.",
+  "    try { if (typeof invalidateTrafficForTrainId !== 'undefined' && invalidateTrafficForTrainId) { invalidateTrafficForTrainId(trainId, world || null); } } catch(e) {}"
+ ],
+ "e7Add": [
+  "  // ATTEMPT17: traffic records load at world load (authoritative re-read after restart), not at script eval.",
+  "  try { if (typeof loadTrafficOnWorldLoad !== \"undefined\" && loadTrafficOnWorldLoad) { loadTrafficOnWorldLoad(world19); } } catch (e) {}"
+ ],
+ "trafficStartMarker": "// Stage10 ATTEMPT17 layered on REAL Stage9 ATTEMPT5 c8cb356b - traffic fixes"
+}
