@@ -1,0 +1,91 @@
+{
+ "attempt": "19",
+ "base": "TRAINS_Phase1_Stage10_ATTEMPT18.mcaddon",
+ "out": "TRAINS_Phase1_Stage10_ATTEMPT19.mcaddon",
+ "version": [
+  1,
+  1,
+  10
+ ],
+ "e9Old": "      if (!existingOwner) { return {ok:true, state:'already_free'}; }",
+ "e9Add": [
+  "      if (!existingOwner) { // ATTEMPT19: in-memory owner map miss => authoritative ownership resolution (no blind already_free)",
+  "        let ix19 = null; try { ix19 = this.getShardIndicesForSectionId(sectionId); } catch (eix) { ix19 = null; }",
+  "        if (!ix19) { return {ok:false, reason:'ownership_unknown', state:'UNKNOWN'}; }",
+  "        let authShard = null; try { authShard = this.shards.get(this.getShardKey(ix19.primary, ix19.sub)) || null; } catch (e0) { authShard = null; }",
+  "        if (!authShard) {",
+  "          if (!world) { return {ok:false, reason:'ownership_unknown', state:'UNKNOWN'}; }",
+  "          try { authShard = ReservationShard.tryLoad(world, ix19.primary, ix19.sub); } catch (e1) { return {ok:false, reason:'ownership_unknown', state:'UNKNOWN'}; }",
+  "          if (!authShard) { return {ok:false, reason:'ownership_unknown', state:'UNKNOWN'}; }",
+  "          // adopt the authoritative persisted shard (identical rebuild semantics to loadAll/getOrCreateShard; DP untouched)",
+  "          try { this.shards.set(this.getShardKey(ix19.primary, ix19.sub), authShard); for (const [rsid, rrec] of authShard.records) { this.knownSectionToTrain.set(rsid, rrec.trainId); let rset = this.knownTrainToSections.get(rrec.trainId); if (!rset) { rset = new Set(); this.knownTrainToSections.set(rrec.trainId, rset); } rset.add(rsid); } } catch (e2) {}",
+  "        }",
+  "        const authRec = (authShard && authShard.records) ? authShard.records.get(sectionId) : null;",
+  "        if (!authRec || !authRec.trainId) { return {ok:true, state:'already_free'}; } // authoritative: the exact resolved shard proves free",
+  "        if (authRec.trainId !== trainId) { return {ok:false, reason:'NOT_OWNER', owner: authRec.trainId}; } // foreign persisted owner: NO mutation",
+  "        // self-owned persisted record: release exactly like the normal path (record, indexes, dirty, persisted flush)",
+  "        authShard.records.delete(sectionId);",
+  "        this.knownSectionToTrain.delete(sectionId);",
+  "        const aset = this.knownTrainToSections.get(trainId);",
+  "        if (aset) { aset.delete(sectionId); if (aset.size===0) this.knownTrainToSections.delete(trainId); }",
+  "        this.markDirtyByKey(this.getShardKey(authShard.shardIndex, authShard.subIndex));",
+  "        try { if (world) this.tickSave(world, 1); } catch(e) {}",
+  "        return {ok:true, state:'RELEASED'};",
+  "      }"
+ ],
+ "prior18": {
+  "attempt": "18",
+  "base": "TRAINS_Phase1_Stage10_ATTEMPT15.mcaddon",
+  "out": "TRAINS_Phase1_Stage10_ATTEMPT18.mcaddon",
+  "version": [
+   1,
+   1,
+   9
+  ],
+  "e1Add": [
+   "  // ATTEMPT16: minimal read-only authoritative ownership lookup for traffic arbitration.",
+   "  // Reads the existing knownSectionToTrain state only - no duplicated state, no mutation.",
+   "  getOwner(sectionId) { if (!sectionId) return null; try { const o = this.knownSectionToTrain.get(sectionId); return o ? o : null; } catch(e) { return null; } }"
+  ],
+  "e8Add": [
+   "  // ATTEMPT18: read-only authoritative ownership tri-state for traffic release arbitration:",
+   "  //   OWNED{owner}  (a reservation record resolves for this section),",
+   "  //   FREE          (the exact deterministic reservation shard answered authoritatively with no record),",
+   "  //   UNKNOWN       (shard unloaded / unresolvable / probe failure - includes never-persisted).",
+   "  // Resolves ONLY the single deterministic reservation shard (fnv1a/djb2 double-hash primary_sub):",
+   "  // in-memory map hit, else direct persisted tryLoad of that one shard. NEVER scans shard Maps,",
+   "  // never creates shards, never writes/caches, never mutates reservation state. A null/absent owner",
+   "  // from the in-memory map alone is NEVER interpreted as FREE (that is the ATTEMPT17 audit blocker).",
+   "  getOwnershipState(sectionId, world) { if (!sectionId) return { state: 'UNKNOWN', owner: null }; try { try { const o = this.knownSectionToTrain.get(sectionId); if (o) return { state: 'OWNED', owner: o }; } catch (e0) { return { state: 'UNKNOWN', owner: null }; } let ix = null; try { ix = this.getShardIndicesForSectionId(sectionId); } catch (e1) { ix = null; } if (!ix) return { state: 'UNKNOWN', owner: null }; let shard = null; try { shard = this.shards.get(this.getShardKey(ix.primary, ix.sub)) || null; } catch (e2) { shard = null; } if (!shard) { if (!world) return { state: 'UNKNOWN', owner: null }; try { shard = ReservationShard.tryLoad(world, ix.primary, ix.sub) || null; } catch (e3) { return { state: 'UNKNOWN', owner: null }; } if (!shard) return { state: 'UNKNOWN', owner: null }; } if (!shard.records) return { state: 'UNKNOWN', owner: null }; const rec = shard.records.get(sectionId); if (rec && rec.trainId) return { state: 'OWNED', owner: rec.trainId }; return { state: 'FREE', owner: null }; } catch (e) { return { state: 'UNKNOWN', owner: null }; } }"
+  ],
+  "e2Add": [
+   "  // ATTEMPT18: bounded deterministic occupancy lookup with ZERO shard iteration. Resolves ONLY through",
+   "  // the authoritative Stage8 SectionLocationIndex (section location/rootPos) -> exact occupancy shard key",
+   "  // (the same rootPos-derived getShardKey used by setOccupied/setEmpty/setUnknown) -> a single Map.get.",
+   "  // If the location cannot be resolved, returns null (safe-fail): absent is NEVER \"free\". NEVER iterates",
+   "  // section or occupancy shard Maps (the ATTEMPT17 sectionManager fallback loop was removed), never",
+   "  // mutates, never auto-creates/loads shards for reads.",
+   "  _resolveOccupancyRecord(sectionId, world) { if (!sectionId) return null; try { let dimId = null; let rootPos = null; try { if (typeof sectionLocationIndexManager !== \"undefined\" && sectionLocationIndexManager && sectionLocationIndexManager.getLocation) { const loc = sectionLocationIndexManager.getLocation(sectionId, world || null); if (loc) { if (loc.dimId) dimId = loc.dimId; if (loc.rootPos) rootPos = loc.rootPos; } } } catch (lerr) {} if (!dimId || !rootPos) return null; const shard = this.shards.get(this.getShardKey(dimId, rootPos)); if (!shard || !shard.records) return null; return shard.records.get(sectionId) || null; } catch (e) { return null; } }",
+   "  // ATTEMPT17/18 safety contract: authoritative occupancy state for a section, or null when it cannot",
+   "  // be established (unknown / unloaded / probe failed). Absent is NEVER free: only an authoritative",
+   "  // KNOWN_EMPTY record proves a section is not occupied. Returns { state, trainId, trainIds } when known.",
+   "  getOccupancyState(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (!rec || !rec.state) return null; return { state: rec.state, trainId: rec.trainId || null, trainIds: (rec.trainIds && rec.trainIds.slice) ? rec.trainIds.slice() : [] }; } catch (e) { return null; } }",
+   "  // ATTEMPT16: read-only occupant accessor (semantics unchanged). ATTEMPT18: index-only direct resolve.",
+   "  getOccupant(sectionId, world) { try { const rec = this._resolveOccupancyRecord(sectionId, world); if (rec && rec.state === \"KNOWN_OCCUPIED\") { if (rec.trainId) return rec.trainId; if (rec.trainIds && rec.trainIds.length) return rec.trainIds[0]; } return null; } catch (e) { return null; } }"
+  ],
+  "e3NavHead": "      try { if (typeof occupancyManager !== \"undefined\" && occupancyManager.getOccupancyState) { const occInfo = occupancyManager.getOccupancyState(sectionId, world); if (occInfo && occInfo.state && (occInfo.state === 'UNKNOWN' || occInfo.state === 'CONFLICT')) { let __owner8 = null; try { if (typeof reservationManager !== \"undefined\" && reservationManager.getOwner) { __owner8 = reservationManager.getOwner(sectionId); } } catch(e9) {} if (__owner8 && __owner8 === trainId) { return {ok:true, canEnter:false, owner: trainId, state:'held', stale:true, releaseWhenPossible:true, reason:'stale_ahead_holding_pending_release'}; } return {ok:true, canEnter:false, state: occInfo.state, owner: (__owner8 || null), reason:'unknown_or_conflict_safely_blocked'}; } // ATTEMPT16 G-fix (ATTEMPT17 form): another train's KNOWN_OCCUPIED section blocks entry; own occupancy remains allowed. ATTEMPT17: direct shard resolution (no all-shard scan); self-held reservation + UNKNOWN/CONFLICT occupancy = authoritative stale-held contract (safe-fail, release-managed, never auto-synced).",
+  "e3NavTail": "if (occInfo && occInfo.state === 'KNOWN_OCCUPIED') { const occIds = []; try { if (occInfo.trainId) occIds.push(occInfo.trainId); if (occInfo.trainIds && occInfo.trainIds.length) { for (const oid of occInfo.trainIds) { if (oid && occIds.indexOf(oid) === -1) occIds.push(oid); } } } catch(e2) {} let __sameTrain = false; for (let __i = 0; __i < occIds.length; __i++) { if (occIds[__i] === trainId) { __sameTrain = true; break; } } if (!__sameTrain && occIds.length > 0) { return {ok:true, canEnter:false, state:'OCCUPIED_BY_OTHER', owner: occIds[0], reason:'occupied_by_other_train'}; } } } } catch(e) {}",
+  "e3Old": "      try { if (typeof occupancyManager !== 'undefined' && occupancyManager.shards) { for (const [k, shard] of occupancyManager.shards) { if (shard.records && shard.records.has(sectionId)) { const occ = shard.records.get(sectionId); if (occ) { if (occ.state === 'UNKNOWN' || occ.state === 'CONFLICT') { return {ok:true, canEnter:false, state: occ.state, reason:'unknown_or_conflict_safely_blocked'}; } } break; } } } } catch(e) {}",
+  "e4Add": "try{if(typeof invalidateTrafficForSectionId!==\"undefined\"&&invalidateTrafficForSectionId){invalidateTrafficForSectionId(id,world);}}catch(e){}",
+  "e5Add": [
+   "    // ATTEMPT16: notify traffic layer of disappearance (guarded hook; occupancy state untouched here).",
+   "    // Traffic safely releases tracked reservations and only drops its record when all releases are confirmed.",
+   "    try { if (typeof invalidateTrafficForTrainId !== 'undefined' && invalidateTrafficForTrainId) { invalidateTrafficForTrainId(trainId, world || null); } } catch(e) {}"
+  ],
+  "e7Add": [
+   "  // ATTEMPT17: traffic records load at world load (authoritative re-read after restart), not at script eval.",
+   "  try { if (typeof loadTrafficOnWorldLoad !== \"undefined\" && loadTrafficOnWorldLoad) { loadTrafficOnWorldLoad(world19); } } catch (e) {}"
+  ],
+  "trafficStartMarker": "// Stage10 ATTEMPT18 layered on REAL Stage9 ATTEMPT5 c8cb356b - traffic fixes"
+ }
+}
